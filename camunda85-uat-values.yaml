@@ -1,0 +1,112 @@
+# =============================================================================
+# Camunda 8.5 -> aks-ded-stg-weu-01 (UAT, PRIVATE) | AUTH ON, behind APIM
+# Public base : https://apim-ded-stg-weu-01.azure-api.net/camunda
+# Access path : APIM (https) -> internal nginx-camunda ingress -> components
+# Chart       : camunda/camunda-platform 10.11.2 (Camunda 8.5.x)
+# ${HOST}     = APIM gateway host (set by script). ${ING_IP}/${SC} also injected.
+# KEY POINTS  :
+#   * Keycloak block is TOP-LEVEL 'identityKeycloak' (NOT identity.keycloak)
+#   * All context paths are nested under /camunda so APIM passes through 1:1
+#   * publicIssuerUrl  = browser-facing (APIM, https)
+#   * issuerBackendUrl = in-cluster Keycloak svc (JWKS validation, no hairpin)
+#   * KC_HOSTNAME_URL pins the public URL so token 'iss' is deterministic
+# =============================================================================
+
+global:
+  identity:
+    keycloak:
+      # Combined-ingress auth path + the path components use to reach Keycloak
+      contextPath: "/camunda/auth"
+      realm: "/realms/camunda-platform"
+    auth:
+      enabled: true
+      # External issuer the BROWSER is redirected to (via APIM, HTTPS)
+      publicIssuerUrl: "https://${HOST}/camunda/auth/realms/camunda-platform"
+      # Internal issuer the SERVICES use for JWKS/token validation (no APIM hairpin)
+      issuerBackendUrl: "http://camunda-keycloak:80/camunda/auth/realms/camunda-platform"
+      operate:
+        redirectUrl: "https://${HOST}/camunda/operate"
+      tasklist:
+        redirectUrl: "https://${HOST}/camunda/tasklist"
+
+  ingress:
+    enabled: true
+    className: nginx-camunda
+    host: "${HOST}"            # APIM gateway host; APIM forwards this as Host header
+    tls:
+      enabled: false           # TLS terminates at APIM; internal hop is HTTP
+
+# ─── Keycloak (TOP-LEVEL identityKeycloak) ───────────────────────────────────
+identityKeycloak:
+  proxy: edge                  # trust X-Forwarded-* from APIM (default, explicit here)
+  httpRelativePath: "/camunda/auth/"   # Keycloak serves under this sub-path
+  extraEnvVars:
+    - name: KEYCLOAK_PROXY_ADDRESS_FORWARDING
+      value: "true"
+    # Pin the public URL so every token's 'iss' = the APIM URL (THE key line if
+    # login redirects misbehave -- verify with the OIDC discovery check post-deploy)
+    - name: KC_HOSTNAME_URL
+      value: "https://${HOST}/camunda/auth"
+    - name: KC_HOSTNAME_ADMIN_URL
+      value: "https://${HOST}/camunda/auth"
+  postgresql:
+    primary:
+      persistence:
+        enabled: true
+        storageClass: ${SC}
+        size: 16Gi
+
+# ─── Web apps under /camunda/* ───────────────────────────────────────────────
+identity:
+  contextPath: "/camunda/identity"
+  fullURL: "https://${HOST}/camunda/identity"
+
+operate:
+  contextPath: "/camunda/operate"
+
+tasklist:
+  contextPath: "/camunda/tasklist"
+
+# ─── Zeebe broker: single-node UAT, persistent PVC ───────────────────────────
+zeebe:
+  clusterSize: 1
+  partitionCount: 1
+  replicationFactor: 1
+  pvcSize: 32Gi
+  pvcStorageClassName: ${SC}
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits:   { cpu: "1",    memory: "2Gi" }
+
+# Zeebe gRPC via INTERNAL Azure LB (private VNet IP)
+zeebeGateway:
+  replicas: 1
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  ingress:
+    grpc:
+      enabled: false
+
+elasticsearch:
+  enabled: true
+  master:
+    replicaCount: 1
+    persistence:
+      enabled: true
+      storageClass: ${SC}
+      size: 64Gi
+    resources:
+      requests: { cpu: "500m", memory: "1Gi" }
+      limits:   { cpu: "1",    memory: "2Gi" }
+
+# ─── Off for UAT footprint (enable when needed) ──────────────────────────────
+optimize:
+  enabled: false
+connectors:
+  enabled: false
+webModeler:
+  enabled: false
+console:
+  enabled: false
